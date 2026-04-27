@@ -1,40 +1,50 @@
 /**
  * Summarize Handler - Stop
  *
- * Runs in the Stop hook (120s timeout, not capped like SessionEnd).
- * This is the ONLY place where we can reliably wait for async work.
- *
- * Flow:
- * 1. Queue summarize request to worker
- * 2. Poll worker until summary processing completes
- * 3. Call /api/sessions/complete to clean up session
- *
- * SessionEnd (1.5s cap from Claude Code) is just a lightweight fallback —
- * all real work must happen here in Stop.
+ * Fire-and-forget: queue the summarize request and exit. The worker handles
+ * summary generation, storage, and session cleanup asynchronously. The Stop
+ * hook does not wait for any of it — Claude Code must exit immediately.
+ * Session-complete cleanup is performed by the SessionEnd handler.
  */
 
 import type { EventHandler, NormalizedHookInput, HookResult } from '../types.js';
-import { ensureWorkerRunning, workerHttpRequest } from '../../shared/worker-utils.js';
+import { executeWithWorkerFallback, isWorkerFallback } from '../../shared/worker-utils.js';
 import { logger } from '../../utils/logger.js';
 import { extractLastMessage } from '../../shared/transcript-parser.js';
-import { HOOK_EXIT_CODES, HOOK_TIMEOUTS, getTimeout } from '../../shared/hook-constants.js';
-
-const SUMMARIZE_TIMEOUT_MS = getTimeout(HOOK_TIMEOUTS.DEFAULT);
-const POLL_INTERVAL_MS = 500;
-const MAX_WAIT_FOR_SUMMARY_MS = 110_000; // 110s — fits within Stop hook's 120s timeout
+import { HOOK_EXIT_CODES } from '../../shared/hook-constants.js';
+import { normalizePlatformSource } from '../../shared/platform-source.js';
+import { shouldTrackProject } from '../../shared/should-track-project.js';
 
 export const summarizeHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
-    // Ensure worker is running before any other logic
-    const workerReady = await ensureWorkerRunning();
-    if (!workerReady) {
-      // Worker not available - skip summary gracefully
+    // Skip Stop hook entirely when firing from an excluded project (notably
+    // OBSERVER_SESSIONS_DIR). Without this, the SDK observer's own Stop hook
+    // queues summaries against its meta-session and triggers a recovery loop.
+    if (input.cwd && !shouldTrackProject(input.cwd)) {
+      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+    }
+
+    // Skip summaries in subagent context — subagents do not own the session summary.
+    // Gate on agentId only: that field is present exclusively for Task-spawned subagents.
+    // agentType alone (no agentId) indicates `--agent`-started main sessions, which still
+    // own their summary. Do this BEFORE the worker call so a subagent Stop hook
+    // does not bootstrap the worker.
+    if (input.agentId) {
+      logger.debug('HOOK', 'Skipping summary: subagent context detected', {
+        sessionId: input.sessionId,
+        agentId: input.agentId,
+        agentType: input.agentType
+      });
       return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
     }
 
     const { sessionId, transcriptPath } = input;
 
     // Validate required fields before processing
+    if (!sessionId) {
+      logger.warn('HOOK', 'summarize: No sessionId provided, skipping');
+      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+    }
     if (!transcriptPath) {
       // No transcript available - skip summary gracefully (not an error)
       logger.debug('HOOK', `No transcriptPath in Stop hook input for session ${sessionId} - skipping summary`);
@@ -66,62 +76,23 @@ export const summarizeHandler: EventHandler = {
       hasLastAssistantMessage: !!lastAssistantMessage
     });
 
+    const platformSource = normalizePlatformSource(input.platform);
+
     // 1. Queue summarize request — worker returns immediately with { status: 'queued' }
-    const response = await workerHttpRequest('/api/sessions/summarize', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    const queueResult = await executeWithWorkerFallback<{ status?: string }>(
+      '/api/sessions/summarize',
+      'POST',
+      {
         contentSessionId: sessionId,
-        last_assistant_message: lastAssistantMessage
-      }),
-      timeoutMs: SUMMARIZE_TIMEOUT_MS
-    });
-
-    if (!response.ok) {
-      return { continue: true, suppressOutput: true };
+        last_assistant_message: lastAssistantMessage,
+        platformSource,
+      },
+    );
+    if (isWorkerFallback(queueResult)) {
+      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
     }
 
-    logger.debug('HOOK', 'Summary request queued, waiting for completion');
-
-    // 2. Poll worker until pending work for this session is done.
-    //    This keeps the Stop hook alive (120s timeout) so the SDK agent
-    //    can finish processing the summary before SessionEnd kills the session.
-    const waitStart = Date.now();
-    while ((Date.now() - waitStart) < MAX_WAIT_FOR_SUMMARY_MS) {
-      await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
-      try {
-        const statusResponse = await workerHttpRequest(`/api/sessions/status?contentSessionId=${encodeURIComponent(sessionId)}`, {
-          timeoutMs: 5000
-        });
-        if (statusResponse.ok) {
-          const status = await statusResponse.json() as { queueLength?: number };
-          if ((status.queueLength ?? 0) === 0) {
-            logger.info('HOOK', 'Summary processing complete', {
-              waitedMs: Date.now() - waitStart
-            });
-            break;
-          }
-        }
-      } catch {
-        // Worker may be busy — keep polling
-      }
-    }
-
-    // 3. Complete the session — clean up active sessions map.
-    //    This runs here in Stop (120s timeout) instead of SessionEnd (1.5s cap)
-    //    so it reliably fires after summary work is done.
-    try {
-      await workerHttpRequest('/api/sessions/complete', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contentSessionId: sessionId }),
-        timeoutMs: 10_000
-      });
-      logger.info('HOOK', 'Session completed in Stop hook', { contentSessionId: sessionId });
-    } catch (err) {
-      logger.warn('HOOK', `Stop hook: session-complete failed: ${err instanceof Error ? err.message : err}`);
-    }
-
+    logger.debug('HOOK', 'Summary request queued, exiting hook');
     return { continue: true, suppressOutput: true };
-  }
+  },
 };

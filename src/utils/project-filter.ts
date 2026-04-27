@@ -6,6 +6,7 @@
  */
 
 import { homedir } from 'os';
+import { basename } from 'path';
 
 /**
  * Convert a glob pattern to a regular expression
@@ -50,6 +51,11 @@ export function isProjectExcluded(projectPath: string, exclusionPatterns: string
 
   // Normalize cwd path separators
   const normalizedProjectPath = projectPath.replace(/\\/g, '/');
+  // Basename match pass: users intuitively expect `observer-sessions` or
+  // `*observer-sessions*` to match any cwd whose final segment matches, but
+  // globToRegex translates `*` → `[^/]*` which can't cross `/`. Without this,
+  // both bare names and basename globs silently fail (#2126 item 1).
+  const projectBasename = basename(normalizedProjectPath);
 
   // Parse comma-separated patterns
   const patternList = exclusionPatterns
@@ -60,11 +66,12 @@ export function isProjectExcluded(projectPath: string, exclusionPatterns: string
   for (const pattern of patternList) {
     try {
       const regex = globToRegex(pattern);
-      if (regex.test(normalizedProjectPath)) {
+      if (regex.test(normalizedProjectPath) || regex.test(projectBasename)) {
         return true;
       }
-    } catch {
+    } catch (error: unknown) {
       // Invalid pattern, skip it
+      console.warn(`[project-filter] Invalid exclusion pattern "${pattern}":`, error instanceof Error ? error.message : String(error));
       continue;
     }
   }

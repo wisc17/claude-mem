@@ -15,6 +15,7 @@ import { writeFileSync, readFileSync, mkdtempSync, rmSync, existsSync } from "no
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
+import { logger } from "../../utils/logger.js";
 
 // CJS-safe require for resolving external packages at runtime.
 // In ESM: import.meta.url works. In CJS bundle (esbuild): __filename works.
@@ -160,6 +161,7 @@ export function loadUserGrammars(projectRoot: string): UserGrammarConfig {
     const content = readFileSync(configPath, "utf-8");
     rawConfig = JSON.parse(content);
   } catch {
+    // [ANTI-PATTERN IGNORED]: .claude-mem.json missing is the normal case for most projects
     userGrammarCache.set(projectRoot, EMPTY_USER_GRAMMAR_CONFIG);
     return EMPTY_USER_GRAMMAR_CONFIG;
   }
@@ -274,7 +276,9 @@ function resolveGrammarPath(language: string): string | null {
       const rootPkgPath = _require.resolve(pkg + "/package.json");
       const resolved = join(dirname(rootPkgPath), subdir);
       if (existsSync(join(resolved, "src"))) return resolved;
-    } catch { /* fall through */ }
+    } catch {
+      // [ANTI-PATTERN IGNORED]: grammar package not installed is expected for unsupported languages
+    }
     return null;
   }
 
@@ -282,6 +286,7 @@ function resolveGrammarPath(language: string): string | null {
     const packageJsonPath = _require.resolve(pkg + "/package.json");
     return dirname(packageJsonPath);
   } catch {
+    // [ANTI-PATTERN IGNORED]: grammar package not installed is expected for unsupported languages
     return null;
   }
 }
@@ -476,15 +481,6 @@ const QUERIES: Record<string, string> = {
 (import_statement) @imp
 (import_declaration) @imp
 `,
-
-  php: `
-(function_definition name: (name) @name) @func
-(method_declaration name: (name) @name) @method
-(class_declaration name: (name) @name) @cls
-(interface_declaration name: (name) @name) @iface
-(trait_declaration name: (name) @name) @trait_def
-(namespace_use_declaration) @imp
-`,
 };
 
 function getQueryKey(language: string): string {
@@ -550,7 +546,9 @@ function getTreeSitterBin(): string {
       cachedBinPath = binPath;
       return binPath;
     }
-  } catch { /* fall through */ }
+  } catch {
+    // [ANTI-PATTERN IGNORED]: tree-sitter-cli not in node_modules is expected; falls back to PATH
+  }
 
   // Fallback: assume it's on PATH
   cachedBinPath = "tree-sitter";
@@ -585,7 +583,8 @@ function runBatchQuery(queryFile: string, sourceFiles: string[], grammarPath: st
   let output: string;
   try {
     output = execFileSync(bin, execArgs, { encoding: "utf-8", timeout: 30000, stdio: ["pipe", "pipe", "pipe"] });
-  } catch {
+  } catch (error) {
+    logger.debug('WORKER', `tree-sitter query failed for ${sourceFiles.length} file(s)`, undefined, error instanceof Error ? error : undefined);
     return new Map();
   }
 

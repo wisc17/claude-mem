@@ -108,17 +108,18 @@ async function callWorkerAPI(
 ): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
   logger.debug('SYSTEM', '→ Worker API', undefined, { endpoint, params });
 
-  try {
-    const searchParams = new URLSearchParams();
+  const searchParams = new URLSearchParams();
 
-    // Convert params to query string
-    for (const [key, value] of Object.entries(params)) {
-      if (value !== undefined && value !== null) {
-        searchParams.append(key, String(value));
-      }
+  // Convert params to query string
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null) {
+      searchParams.append(key, String(value));
     }
+  }
 
-    const apiPath = `${endpoint}?${searchParams}`;
+  const apiPath = `${endpoint}?${searchParams}`;
+
+  try {
     const response = await workerHttpRequest(apiPath);
 
     if (!response.ok) {
@@ -132,8 +133,8 @@ async function callWorkerAPI(
 
     // Worker returns { content: [...] } format directly
     return data;
-  } catch (error) {
-    logger.error('SYSTEM', '← Worker API error', { endpoint }, error as Error);
+  } catch (error: unknown) {
+    logger.error('SYSTEM', '← Worker API error', { endpoint }, error instanceof Error ? error : new Error(String(error)));
     return {
       content: [{
         type: 'text' as const,
@@ -142,6 +143,33 @@ async function callWorkerAPI(
       isError: true
     };
   }
+}
+
+async function executeWorkerPostRequest(
+  endpoint: string,
+  body: Record<string, any>
+): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
+  const response = await workerHttpRequest(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Worker API error (${response.status}): ${errorText}`);
+  }
+
+  const data = await response.json();
+
+  logger.debug('HTTP', 'Worker API success (POST)', undefined, { endpoint });
+
+  return {
+    content: [{
+      type: 'text' as const,
+      text: JSON.stringify(data, null, 2)
+    }]
+  };
 }
 
 /**
@@ -154,30 +182,9 @@ async function callWorkerAPIPost(
   logger.debug('HTTP', 'Worker API request (POST)', undefined, { endpoint });
 
   try {
-    const response = await workerHttpRequest(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Worker API error (${response.status}): ${errorText}`);
-    }
-
-    const data = await response.json();
-
-    logger.debug('HTTP', 'Worker API success (POST)', undefined, { endpoint });
-
-    // Wrap raw data in MCP format
-    return {
-      content: [{
-        type: 'text' as const,
-        text: JSON.stringify(data, null, 2)
-      }]
-    };
-  } catch (error) {
-    logger.error('HTTP', 'Worker API error (POST)', { endpoint }, error as Error);
+    return await executeWorkerPostRequest(endpoint, body);
+  } catch (error: unknown) {
+    logger.error('HTTP', 'Worker API error (POST)', { endpoint }, error instanceof Error ? error : new Error(String(error)));
     return {
       content: [{
         type: 'text' as const,
@@ -195,9 +202,9 @@ async function verifyWorkerConnection(): Promise<boolean> {
   try {
     const response = await workerHttpRequest('/api/health');
     return response.ok;
-  } catch (error) {
+  } catch (error: unknown) {
     // Expected during worker startup or if worker is down
-    logger.debug('SYSTEM', 'Worker health check failed', {}, error as Error);
+    logger.debug('SYSTEM', 'Worker health check failed', {}, error instanceof Error ? error : new Error(String(error)));
     return false;
   }
 }
@@ -229,12 +236,12 @@ async function ensureWorkerConnection(): Promise<boolean> {
       );
     }
     return started;
-  } catch (error) {
+  } catch (error: unknown) {
     logger.error(
       'SYSTEM',
       'Worker auto-start threw — MCP tools that require the worker (search, timeline, get_observations) will fail until the worker is running.',
       undefined,
-      error as Error
+      error instanceof Error ? error : new Error(String(error))
     );
     return false;
   }
@@ -284,7 +291,17 @@ NEVER fetch full details without filtering first. 10x token savings.`,
     description: 'Step 1: Search memory. Returns index with IDs. Params: query, limit, project, type, obs_type, dateStart, dateEnd, offset, orderBy',
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        query: { type: 'string', description: 'Search query' },
+        limit: { type: 'number', description: 'Max results (default 20)' },
+        project: { type: 'string', description: 'Filter by project name' },
+        type: { type: 'string', description: 'Filter by observation type' },
+        obs_type: { type: 'string', description: 'Filter by obs_type field' },
+        dateStart: { type: 'string', description: 'Start date filter (ISO)' },
+        dateEnd: { type: 'string', description: 'End date filter (ISO)' },
+        offset: { type: 'number', description: 'Pagination offset' },
+        orderBy: { type: 'string', description: 'Sort order: date_desc or date_asc' }
+      },
       additionalProperties: true
     },
     handler: async (args: any) => {
@@ -297,7 +314,13 @@ NEVER fetch full details without filtering first. 10x token savings.`,
     description: 'Step 2: Get context around results. Params: anchor (observation ID) OR query (finds anchor automatically), depth_before, depth_after, project',
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        anchor: { type: 'number', description: 'Observation ID to center the timeline around' },
+        query: { type: 'string', description: 'Query to find anchor automatically' },
+        depth_before: { type: 'number', description: 'Items before anchor (default 3)' },
+        depth_after: { type: 'number', description: 'Items after anchor (default 3)' },
+        project: { type: 'string', description: 'Filter by project name' }
+      },
       additionalProperties: true
     },
     handler: async (args: any) => {
@@ -435,6 +458,111 @@ NEVER fetch full details without filtering first. 10x token savings.`,
         }]
       };
     }
+  },
+  {
+    name: 'build_corpus',
+    description: 'Build a knowledge corpus from filtered observations. Creates a queryable knowledge agent. Params: name (required), description, project, types (comma-separated), concepts (comma-separated), files (comma-separated), query, dateStart, dateEnd, limit',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Corpus name (used as filename)' },
+        description: { type: 'string', description: 'What this corpus is about' },
+        project: { type: 'string', description: 'Filter by project' },
+        types: { type: 'string', description: 'Comma-separated observation types: decision,bugfix,feature,refactor,discovery,change' },
+        concepts: { type: 'string', description: 'Comma-separated concepts to filter by' },
+        files: { type: 'string', description: 'Comma-separated file paths to filter by' },
+        query: { type: 'string', description: 'Semantic search query' },
+        dateStart: { type: 'string', description: 'Start date (ISO format)' },
+        dateEnd: { type: 'string', description: 'End date (ISO format)' },
+        limit: { type: 'number', description: 'Maximum observations (default 500)' }
+      },
+      required: ['name'],
+      additionalProperties: true
+    },
+    handler: async (args: any) => {
+      return await callWorkerAPIPost('/api/corpus', args);
+    }
+  },
+  {
+    name: 'list_corpora',
+    description: 'List all knowledge corpora with their stats and priming status',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: true
+    },
+    handler: async (args: any) => {
+      return await callWorkerAPI('/api/corpus', args);
+    }
+  },
+  {
+    name: 'prime_corpus',
+    description: 'Prime a knowledge corpus — creates an AI session loaded with the corpus knowledge. Must be called before query_corpus.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Name of the corpus to prime' }
+      },
+      required: ['name'],
+      additionalProperties: true
+    },
+    handler: async (args: any) => {
+      const { name, ...rest } = args;
+      if (typeof name !== 'string' || name.trim() === '') throw new Error('Missing required argument: name');
+      return await callWorkerAPIPost(`/api/corpus/${encodeURIComponent(name)}/prime`, rest);
+    }
+  },
+  {
+    name: 'query_corpus',
+    description: 'Ask a question to a primed knowledge corpus. The corpus must be primed first with prime_corpus.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Name of the corpus to query' },
+        question: { type: 'string', description: 'The question to ask' }
+      },
+      required: ['name', 'question'],
+      additionalProperties: true
+    },
+    handler: async (args: any) => {
+      const { name, ...rest } = args;
+      if (typeof name !== 'string' || name.trim() === '') throw new Error('Missing required argument: name');
+      return await callWorkerAPIPost(`/api/corpus/${encodeURIComponent(name)}/query`, rest);
+    }
+  },
+  {
+    name: 'rebuild_corpus',
+    description: 'Rebuild a knowledge corpus from its stored filter — re-runs the search to refresh with new observations. Does not re-prime the session.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Name of the corpus to rebuild' }
+      },
+      required: ['name'],
+      additionalProperties: true
+    },
+    handler: async (args: any) => {
+      const { name, ...rest } = args;
+      if (typeof name !== 'string' || name.trim() === '') throw new Error('Missing required argument: name');
+      return await callWorkerAPIPost(`/api/corpus/${encodeURIComponent(name)}/rebuild`, rest);
+    }
+  },
+  {
+    name: 'reprime_corpus',
+    description: 'Create a fresh knowledge agent session for a corpus, clearing prior Q&A context. Use when conversation has drifted or after rebuilding.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Name of the corpus to reprime' }
+      },
+      required: ['name'],
+      additionalProperties: true
+    },
+    handler: async (args: any) => {
+      const { name, ...rest } = args;
+      if (typeof name !== 'string' || name.trim() === '') throw new Error('Missing required argument: name');
+      return await callWorkerAPIPost(`/api/corpus/${encodeURIComponent(name)}/reprime`, rest);
+    }
   }
 ];
 
@@ -472,8 +600,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     return await tool.handler(request.params.arguments || {});
-  } catch (error) {
-    logger.error('SYSTEM', 'Tool execution failed', { tool: request.params.name }, error as Error);
+  } catch (error: unknown) {
+    logger.error('SYSTEM', 'Tool execution failed', { tool: request.params.name }, error instanceof Error ? error : new Error(String(error)));
     return {
       content: [{
         type: 'text' as const,
